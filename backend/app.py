@@ -49,8 +49,10 @@ logger = logging.getLogger('verito')
 # CORS — allow the frontend dev server (Vite) and its preview mode
 ALLOWED_ORIGINS = [
     "http://localhost:5173",
+    "http://localhost:5174",
     "http://localhost:4173",
     "http://127.0.0.1:5173",
+    "http://127.0.0.1:5174",
     "http://127.0.0.1:4173",
 ]
 
@@ -257,11 +259,19 @@ def verify():
             "Stage 6/6 — Synthesizing analysis..."
         )
 
-        analysis, status = synthesize_analysis(
+        # synthesize_analysis() returns a dictionary:
+        # {
+        #     "status": "...",
+        #     "analysis": "..."
+        # }
+        analysis_result = synthesize_analysis(
             claim,
             supporting,
             contradicting,
         )
+
+        analysis = analysis_result["analysis"]
+        status = analysis_result["status"]
 
         logger.info(
             f"  Status: {status}"
