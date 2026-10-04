@@ -7,11 +7,13 @@ import type { VerifyRequest, VerifyResponse, VerificationError } from '../types/
 
 /**
  * Retrieves the base API URL from the environment configuration.
+ * Uses the deployed VERITO backend automatically in production.
  * Defaults to http://localhost:5000 for local Flask backend development.
  */
 export function getApiBaseUrl(): string {
   // Access Vite environment variable safely across browser and test runtimes
   let envUrl: string | undefined;
+
   try {
     if (typeof import.meta !== 'undefined' && 'env' in import.meta && import.meta.env) {
       envUrl = import.meta.env.VITE_API_BASE_URL;
@@ -20,9 +22,21 @@ export function getApiBaseUrl(): string {
     envUrl = undefined;
   }
 
+  // Use VITE_API_BASE_URL when it is available.
   if (typeof envUrl === 'string' && envUrl.trim()) {
     return envUrl.trim().replace(/\/+$/, '');
   }
+
+  // Production fallback for the deployed VERITO frontend.
+  if (
+    typeof window !== 'undefined' &&
+    window.location.hostname !== 'localhost' &&
+    window.location.hostname !== '127.0.0.1'
+  ) {
+    return 'https://verito-ai.onrender.com';
+  }
+
+  // Local development fallback.
   return 'http://localhost:5000';
 }
 
@@ -67,7 +81,7 @@ export async function verifyArticle(url: string): Promise<VerifyResponse> {
   } catch (err: unknown) {
     // Network failure, connection refused, or CORS blockage
     const rawMessage = err instanceof Error ? err.message : String(err);
-    
+
     throw new ApiError({
       title: 'Cannot Connect to Verification Service',
       message:
@@ -82,6 +96,7 @@ export async function verifyArticle(url: string): Promise<VerifyResponse> {
 
   // Handle HTTP status codes
   let responseData: any;
+
   try {
     responseData = await response.json();
   } catch {
@@ -91,12 +106,13 @@ export async function verifyArticle(url: string): Promise<VerifyResponse> {
         'The verification server returned a non-JSON or malformed response. Status code: ' +
         response.status,
       technicalDetails: `Failed to parse response body as JSON. HTTP ${response.status} ${response.statusText}`,
-      actionSuggestion: 'Please verify the backend endpoint implementation and response format.',
+      actionSuggestion:
+        'Please verify the backend endpoint implementation and response format.',
     });
   }
 
   if (!response.ok) {
-    // Backend returned an error object (e.g., { "error": "...", "message": "..." })
+    // Backend returned an error object
     const serverErrorMessage =
       responseData?.error ||
       responseData?.message ||
@@ -120,8 +136,10 @@ export async function verifyArticle(url: string): Promise<VerifyResponse> {
     throw new ApiError({
       title: 'Unexpected Response Format',
       message: 'The server returned an unexpected response structure.',
-      technicalDetails: 'Expected a JSON object but received ' + typeof responseData,
-      actionSuggestion: 'Ensure the Flask endpoint returns a JSON dictionary conforming to the contract.',
+      technicalDetails:
+        'Expected a JSON object but received ' + typeof responseData,
+      actionSuggestion:
+        'Ensure the Flask endpoint returns a JSON dictionary conforming to the contract.',
     });
   }
 
@@ -130,7 +148,8 @@ export async function verifyArticle(url: string): Promise<VerifyResponse> {
     throw new ApiError({
       title: 'Verification Error',
       message: String(responseData.error),
-      actionSuggestion: 'The backend reported an error while processing the article.',
+      actionSuggestion:
+        'The backend reported an error while processing the article.',
     });
   }
 
