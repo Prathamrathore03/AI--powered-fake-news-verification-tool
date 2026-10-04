@@ -440,6 +440,11 @@ EVIDENCE:
             raw
         )
 
+        # TEMPORARY DEBUG LOG — shows exactly what Gemini returned.
+        print(
+            f"[classifier] RAW GEMINI RESPONSE: {raw}"
+        )
+
         if classifications is None:
 
             print(
