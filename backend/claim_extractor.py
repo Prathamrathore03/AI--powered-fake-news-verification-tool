@@ -1,4 +1,5 @@
 import os
+import re
 import time
 
 from dotenv import load_dotenv
@@ -6,11 +7,11 @@ from google import genai
 
 load_dotenv()
 
-PRIMARY_MODEL = "gemini-3.8-flash"
-FALLBACK_MODEL = "gemini-3.5-flash-lite"
+PRIMARY_MODEL = os.getenv("GEMINI_MODEL", "gemini-flash-lite-latest")
+FALLBACK_MODEL = os.getenv("GEMINI_FALLBACK_MODEL", "gemini-3.5-flash-lite")
 
 MAX_ARTICLE_CHARS = 6000
-MAX_ATTEMPTS = 3
+MAX_ATTEMPTS = 2
 
 
 def _generate_with_retry(client, prompt):
@@ -19,6 +20,8 @@ def _generate_with_retry(client, prompt):
         FALLBACK_MODEL,
     ]
 
+    # Deduplicate while preserving order
+    models_to_try = list(dict.fromkeys(models_to_try))
     last_error = None
 
     for model in models_to_try:
@@ -30,8 +33,9 @@ def _generate_with_retry(client, prompt):
                 )
 
                 text = (response.text or "").strip()
-
                 if text:
+                    # Clean up quotes or formatting
+                    text = re.sub(r'^["\']|["\']$', '', text).strip()
                     return text
 
                 raise ValueError(
@@ -40,31 +44,41 @@ def _generate_with_retry(client, prompt):
 
             except Exception as error:
                 last_error = error
-
                 error_text = str(error).lower()
+
+                quota_exhausted = (
+                    "429" in error_text
+                    or "resource_exhausted" in error_text
+                    or "quota" in error_text
+                )
 
                 is_temporary = (
                     "503" in error_text
                     or "unavailable" in error_text
                     or "high demand" in error_text
                     or "overloaded" in error_text
-                    or "429" in error_text
-                    or "resource_exhausted" in error_text
                 )
 
+                if quota_exhausted:
+                    print(f"[claim_extractor] Model {model} quota exhausted. Trying next model.")
+                    break  # Don't retry same model if quota is exhausted
+
                 if not is_temporary:
-                    raise
+                    break  # Non-retryable error, try next model
 
                 if attempt < MAX_ATTEMPTS - 1:
-                    time.sleep(2 ** attempt)
+                    time.sleep(1)
 
-        print(f"Primary model unavailable. Trying {model}.")
+        print(f"[claim_extractor] Model {model} unavailable or exhausted. Trying next model.")
 
-    raise last_error
+    if last_error:
+        raise last_error
+
+    raise RuntimeError("Failed to extract claim from available models.")
 
 
 def extract_claim(article):
-    api_key = os.getenv("GEMINI_API_KEY")
+    api_key = os.getenv("GEMINI_API_KEY", "").strip()
 
     if not api_key:
         raise EnvironmentError(
@@ -87,7 +101,7 @@ Do not give an opinion.
 Do not summarize the entire article.
 Do not include multiple claims.
 
-Return ONLY the claim, with no quotation marks and no explanation.
+Return ONLY the single claim sentence, with no quotation marks and no explanation.
 
 Article title:
 {title}

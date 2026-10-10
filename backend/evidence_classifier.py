@@ -8,8 +8,8 @@ from google import genai
 
 load_dotenv()
 
-PRIMARY_MODEL = "gemini-3.5-flash-lite"
-FALLBACK_MODEL = "gemini-3.8-flash"
+PRIMARY_MODEL = os.getenv("GEMINI_MODEL", "gemini-flash-lite-latest")
+FALLBACK_MODEL = os.getenv("GEMINI_FALLBACK_MODEL", "gemini-3.5-flash-lite")
 
 MAX_EVIDENCE_ITEMS = 15
 MAX_SNIPPET_CHARS = 350
@@ -18,9 +18,8 @@ MAX_SNIPPET_CHARS = 350
 def _rating_classification(item):
     """
     Classify an evidence item immediately when it already contains
-    an explicit fact-check rating.
+    an explicit fact-check rating from a known registry.
     """
-
     rating = str(
         item.get("_textual_rating", "")
     ).lower().strip()
@@ -49,9 +48,12 @@ def _rating_classification(item):
         "misinformation",
         "disinformation",
         "not true",
+        "untrue",
         "false context",
         "missing context",
         "altered",
+        "out of context",
+        "pants on fire",
     ]
 
     if any(term in rating for term in contradicting_terms):
@@ -65,202 +67,132 @@ def _rating_classification(item):
 
 def _gemini_classify(client, prompt):
     """
-    Try Gemini models.
-
-    503/high-demand errors are retried once.
-    429 quota errors are not repeatedly retried because doing so
-    cannot restore an exhausted quota.
+    Classify evidence items using fast Gemini models.
+    429 quota errors break immediately without looping retries.
     """
-
     models = [
         PRIMARY_MODEL,
         FALLBACK_MODEL,
     ]
+    # Deduplicate while preserving order
+    models = list(dict.fromkeys(models))
 
     last_error = None
 
     for model in models:
+        try:
+            response = client.models.generate_content(
+                model=model,
+                contents=prompt,
+            )
 
-        for attempt in range(2):
+            raw = (response.text or "").strip()
+            if raw:
+                return raw
 
-            try:
-                response = client.models.generate_content(
-                    model=model,
-                    contents=prompt,
-                )
+            raise ValueError(
+                f"Gemini returned an empty response from {model}."
+            )
 
-                raw = (response.text or "").strip()
+        except Exception as error:
+            last_error = error
+            error_text = str(error).lower()
 
-                if raw:
-                    print(
-                        f"[classifier] Gemini response received "
-                        f"from {model} ({len(raw)} chars)."
+            quota_error = (
+                "429" in error_text
+                or "resource_exhausted" in error_text
+                or "quota" in error_text
+            )
+
+            if quota_error:
+                print(f"[classifier] Gemini model {model} quota exhausted. Trying next model.")
+                continue
+
+            temporary_error = (
+                "503" in error_text
+                or "unavailable" in error_text
+                or "high demand" in error_text
+                or "overloaded" in error_text
+            )
+
+            if temporary_error:
+                time.sleep(1)
+                try:
+                    retry_resp = client.models.generate_content(
+                        model=model,
+                        contents=prompt,
                     )
-                    return raw
+                    raw = (retry_resp.text or "").strip()
+                    if raw:
+                        return raw
+                except Exception:
+                    pass
 
-                raise ValueError(
-                    f"Gemini returned an empty response from {model}."
-                )
-
-            except Exception as error:
-
-                last_error = error
-
-                error_text = str(error).lower()
-
-                quota_error = (
-                    "429" in error_text
-                    or "resource_exhausted" in error_text
-                    or "quota" in error_text
-                )
-
-                temporary_error = (
-                    "503" in error_text
-                    or "unavailable" in error_text
-                    or "high demand" in error_text
-                    or "overloaded" in error_text
-                )
-
-                if quota_error:
-                    print(
-                        f"[classifier] Gemini model {model} "
-                        f"quota unavailable."
-                    )
-
-                    # Do not waste additional quota requests.
-                    break
-
-                if not temporary_error:
-                    raise
-
-                if attempt == 0:
-                    time.sleep(1)
-
-        print(
-            f"[classifier] Gemini model {model} unavailable. "
-            f"Trying next model."
-        )
+            print(f"[classifier] Gemini model {model} failed. Trying next model.")
 
     if last_error:
         raise last_error
 
-    raise RuntimeError(
-        "Gemini classification failed without a specific error."
-    )
+    raise RuntimeError("Gemini classification failed on all candidate models.")
 
 
 def _extract_json_array(raw):
     """
-    Extract a JSON array from Gemini's response.
+    Safely extract a JSON array from Gemini's response text.
     """
-
     if not raw:
         return None
 
     text = raw.strip()
-
-    text = re.sub(
-        r"^```(?:json)?\s*",
-        "",
-        text,
-        flags=re.IGNORECASE,
-    )
-
-    text = re.sub(
-        r"\s*```$",
-        "",
-        text,
-        flags=re.IGNORECASE,
-    )
-
-    text = text.strip()
+    text = re.sub(r"^```(?:json)?\s*", "", text, flags=re.IGNORECASE)
+    text = re.sub(r"\s*```$", "", text, flags=re.IGNORECASE).strip()
 
     try:
         parsed = json.loads(text)
-
         if isinstance(parsed, list):
             return parsed
-
         if isinstance(parsed, dict):
-
-            for key in (
-                "classifications",
-                "results",
-                "evidence",
-                "items",
-            ):
+            for key in ("classifications", "results", "evidence", "items"):
                 value = parsed.get(key)
-
                 if isinstance(value, list):
                     return value
-
     except json.JSONDecodeError:
         pass
 
     start = text.find("[")
-
-    if start == -1:
-        return None
-
     end = text.rfind("]")
-
-    if end == -1 or end <= start:
-        return None
-
-    candidate = text[start:end + 1]
-
-    try:
-        parsed = json.loads(candidate)
-
-        if isinstance(parsed, list):
-            return parsed
-
-    except json.JSONDecodeError:
-        return None
+    if start != -1 and end != -1 and end > start:
+        candidate = text[start:end + 1]
+        try:
+            parsed = json.loads(candidate)
+            if isinstance(parsed, list):
+                return parsed
+        except json.JSONDecodeError:
+            pass
 
     return None
 
 
 def _normalize_classification(value):
     """
-    Convert common Gemini classification variants into
-    VERITO's three allowed labels.
+    Normalize LLM classification string into VERITO labels.
     """
-
-    classification = str(
-        value or ""
-    ).upper().strip()
-
-    classification = classification.replace("-", "_")
-    classification = classification.replace(" ", "_")
+    classification = str(value or "").upper().strip()
+    classification = classification.replace("-", "_").replace(" ", "_")
 
     if classification in (
-        "SUPPORTING",
-        "SUPPORT",
-        "SUPPORTED",
-        "TRUE",
-        "CONFIRMS",
-        "CONFIRMING",
+        "SUPPORTING", "SUPPORT", "SUPPORTED", "TRUE", "CONFIRMS", "CONFIRMING"
     ):
         return "SUPPORTING"
 
     if classification in (
-        "CONTRADICTING",
-        "CONTRADICT",
-        "CONTRADICTS",
-        "CONTRADICTORY",
-        "FALSE",
-        "REFUTES",
-        "REFUTING",
+        "CONTRADICTING", "CONTRADICT", "CONTRADICTS", "CONTRADICTORY",
+        "FALSE", "REFUTES", "REFUTING", "DEBUNKS", "DEBUNKED"
     ):
         return "CONTRADICTING"
 
     if classification in (
-        "IRRELEVANT",
-        "NEUTRAL",
-        "UNCLEAR",
-        "UNRELATED",
-        "INSUFFICIENT",
+        "IRRELEVANT", "NEUTRAL", "UNCLEAR", "UNRELATED", "INSUFFICIENT", "UNVERIFIED"
     ):
         return "IRRELEVANT"
 
@@ -268,135 +200,91 @@ def _normalize_classification(value):
 
 
 def _meaningful_words(text):
-    """
-    Extract useful content words for the emergency local fallback.
-    """
-
-    words = re.findall(
-        r"[a-zA-Z]{4,}",
-        str(text or "").lower(),
-    )
-
+    """Extract content words for fallback analysis."""
+    words = re.findall(r"[a-zA-Z]{3,}", str(text or "").lower())
     stop_words = {
-        "about",
-        "after",
-        "against",
-        "being",
-        "between",
-        "could",
-        "from",
-        "have",
-        "into",
-        "more",
-        "other",
-        "said",
-        "that",
-        "their",
-        "there",
-        "these",
-        "they",
-        "this",
-        "those",
-        "through",
-        "under",
-        "were",
-        "which",
-        "with",
-        "would",
-        "news",
-        "article",
-        "report",
-        "reports",
-        "reported",
+        "about", "after", "against", "being", "between", "could", "from",
+        "have", "into", "more", "other", "said", "that", "their", "there",
+        "these", "they", "this", "those", "through", "under", "were",
+        "which", "with", "would", "news", "article", "report", "reports",
+        "reported", "today", "yesterday", "recent",
     }
-
-    return {
-        word
-        for word in words
-        if word not in stop_words
-    }
+    return {w for w in words if w not in stop_words}
 
 
 def _local_fallback_classify(claim, remaining):
     """
-    Conservative non-AI fallback.
+    Trustworthy conservative non-AI fallback.
 
-    This is NOT treated as a replacement for Gemini reasoning.
-    It only identifies strongly matching evidence when the
-    Gemini service is unavailable.
-
-    Returns:
-        supporting, contradicting
+    CRITICAL SAFETY RULES:
+    1. A source is NEVER classified as supporting merely because it repeats
+       the claim words or has lexical overlap.
+    2. Clickbait, questions, social media rumors, and vague mentions
+       are classified as IRRELEVANT.
+    3. Explicit debunking / denial / hoax mentions are classified as CONTRADICTING.
+    4. Explicit affirmative confirmation by authoritative entities with no
+       question or rumor markers may be classified as SUPPORTING.
+    5. When in doubt, items remain unclassified / IRRELEVANT.
     """
-
     supporting = []
     contradicting = []
 
     claim_words = _meaningful_words(claim)
-
     if not claim_words:
         return supporting, contradicting
 
     contradiction_phrases = [
-        "false",
-        "fake",
-        "hoax",
-        "debunked",
-        "fact check",
-        "fact-check",
-        "incorrect",
-        "misleading",
-        "not true",
-        "denied",
-        "refuted",
-        "refutes",
-        "contradicts",
-        "fabricated",
-        "misinformation",
-        "disinformation",
+        "false", "fake", "hoax", "debunked", "fact check", "fact-check",
+        "incorrect", "misleading", "not true", "untrue", "denied",
+        "denies", "refuted", "refutes", "contradicts", "fabricated",
+        "misinformation", "disinformation", "death hoax", "alive and well",
+        "still alive", "not dead", "falsely claimed", "no truth",
+    ]
+
+    # Explicit phrases that indicate rumors, questions, or clickbait
+    rumor_or_question_phrases = [
+        "did ", "is it true", "rumor", "rumour", "rumors", "rumours",
+        "viral claim", "viral post", "social media claims", "tiktok claims",
+        "fans react to rumor", "fans fear", "death rumor", "unconfirmed",
+        "alleged", "allegedly", "claims circulate",
+    ]
+
+    # Explicit affirmative confirmation markers required for SUPPORTING in fallback
+    affirmative_confirmation_phrases = [
+        "officially confirmed", "authorities confirmed", "police confirmed",
+        "family confirmed", "hospital confirmed", "statement confirms",
+        "reuters confirms", "ap confirms", "confirmed by", "passed away at age",
+        "died Tuesday", "died Wednesday", "died Thursday", "died Friday",
+        "died Saturday", "died Sunday", "died Monday", "obituary for",
     ]
 
     for item in remaining:
-
-        title = str(
-            item.get("title", "")
-        ).strip()
-
-        snippet = str(
-            item.get("snippet", "")
-        ).strip()
-
+        title = str(item.get("title", "")).strip()
+        snippet = str(item.get("snippet", "")).strip()
         combined = f"{title} {snippet}".lower()
 
-        evidence_words = _meaningful_words(
-            f"{title} {snippet}"
-        )
-
+        evidence_words = _meaningful_words(combined)
         if not evidence_words:
             continue
 
-        overlap = claim_words.intersection(
-            evidence_words
-        )
+        overlap = claim_words.intersection(evidence_words)
+        overlap_ratio = len(overlap) / len(claim_words)
 
-        overlap_ratio = (
-            len(overlap) / len(claim_words)
-        )
-
-        contradiction_present = any(
-            phrase in combined
-            for phrase in contradiction_phrases
-        )
-
-        # Require substantial lexical overlap before using
-        # the fallback. This avoids random search results.
-        if overlap_ratio < 0.35:
+        # 1. Contradiction takes first priority
+        if any(phrase in combined for phrase in contradiction_phrases):
+            contradicting.append(item)
             continue
 
-        if contradiction_present:
-            contradicting.append(item)
-        else:
+        # 2. Questions or rumor markers -> IRRELEVANT (never supporting!)
+        if "?" in title or any(phrase in combined for phrase in rumor_or_question_phrases):
+            continue
+
+        # 3. Require strict affirmative confirmation to support without LLM
+        if overlap_ratio >= 0.40 and any(phrase in combined for phrase in affirmative_confirmation_phrases):
             supporting.append(item)
+        else:
+            # All other matching items are treated as neutral/unverified, NOT supporting!
+            continue
 
     return supporting, contradicting
 
@@ -406,166 +294,78 @@ def classify_evidence(claim, evidence):
     Classify evidence as supporting or contradicting.
 
     Priority:
-      1. Explicit fact-check ratings.
-      2. Gemini classification.
+      1. Explicit fact-check registry ratings.
+      2. High-precision Gemini classification.
       3. Conservative local fallback when Gemini is unavailable.
-
-    The local fallback is intentionally conservative and is only
-    used to keep VERITO operational when the external AI service
-    is unavailable.
     """
-
     supporting = []
     contradicting = []
     remaining = []
 
-    # ---------------------------------------------------------------
-    # First: explicit fact-check ratings
-    # ---------------------------------------------------------------
-
+    # 1. Explicit fact-check ratings
     for item in evidence[:MAX_EVIDENCE_ITEMS]:
-
         rating_result = _rating_classification(item)
-
         if rating_result == "supporting":
-
             supporting.append(item)
-
         elif rating_result == "contradicting":
-
             contradicting.append(item)
-
         else:
-
             remaining.append(item)
-
-    print(
-        f"[classifier] Explicit ratings: "
-        f"{len(supporting)} supporting, "
-        f"{len(contradicting)} contradicting."
-    )
 
     if not remaining:
         return supporting[:5], contradicting[:5]
 
-    # ---------------------------------------------------------------
-    # Gemini configuration
-    # ---------------------------------------------------------------
-
-    api_key = os.getenv(
-        "GEMINI_API_KEY",
-        ""
-    ).strip()
+    # 2. Gemini classification
+    api_key = os.getenv("GEMINI_API_KEY", "").strip()
 
     if not api_key:
+        print("[classifier] WARNING: GEMINI_API_KEY not set. Using conservative local fallback.")
+        fb_sup, fb_con = _local_fallback_classify(claim, remaining)
+        supporting.extend(fb_sup)
+        contradicting.extend(fb_con)
+        return supporting[:5], contradicting[:5]
 
-        print(
-            "[classifier] WARNING: GEMINI_API_KEY is not configured."
-        )
-
-        fallback_supporting, fallback_contradicting = (
-            _local_fallback_classify(
-                claim,
-                remaining,
-            )
-        )
-
-        supporting.extend(
-            fallback_supporting
-        )
-
-        contradicting.extend(
-            fallback_contradicting
-        )
-
-        return (
-            supporting[:5],
-            contradicting[:5],
-        )
-
-    # ---------------------------------------------------------------
-    # Prepare evidence for Gemini
-    # ---------------------------------------------------------------
-
+    # Prepare evidence lines for Gemini
     evidence_lines = []
-
-    for index, item in enumerate(
-        remaining,
-        start=1
-    ):
-
-        title = str(
-            item.get("title", "")
-        ).strip()
-
-        source = str(
-            item.get("source", "")
-        ).strip()
-
-        url = str(
-            item.get("url", "")
-        ).strip()
-
-        snippet = str(
-            item.get("snippet", "")
-        ).strip()
+    for index, item in enumerate(remaining, start=1):
+        title = str(item.get("title", "")).strip()
+        source = str(item.get("source", "")).strip()
+        url = str(item.get("url", "")).strip()
+        snippet = str(item.get("snippet", "")).strip()
 
         evidence_lines.append(
-            f"""
-ITEM {index}
-Title: {title}
-Source: {source}
-URL: {url}
-Snippet: {snippet[:MAX_SNIPPET_CHARS]}
-"""
+            f"ITEM {index}\n"
+            f"Title: {title}\n"
+            f"Source: {source}\n"
+            f"URL: {url}\n"
+            f"Snippet: {snippet[:MAX_SNIPPET_CHARS]}\n"
         )
 
-    evidence_text = "\n".join(
-        evidence_lines
-    )
-
-    # ---------------------------------------------------------------
-    # Gemini prompt
-    # ---------------------------------------------------------------
+    evidence_text = "\n".join(evidence_lines)
 
     prompt = f"""
-You are the evidence classification component of VERITO,
-an evidence-based news claim verification system.
+You are the evidence classification component of VERITO, an evidence-based
+news verification system.
 
-Your task is to classify EVERY evidence item below in relation
-to the CLAIM.
+Evaluate each evidence item in relation to the CLAIM.
 
-Definitions:
+DEFINITIONS:
+- SUPPORTING: The evidence independently confirms or corroborates the factual claim with authoritative reporting or verified facts.
+- CONTRADICTING: The evidence explicitly refutes, disproves, denies, or contradicts the claim (e.g. confirms a report is a hoax, false, or denied by officials/representatives).
+- IRRELEVANT: The evidence does NOT meaningfully prove or disprove the claim.
 
-SUPPORTING:
-The evidence provides information that directly supports,
-confirms, or independently corroborates the claim.
+STRICT VERIFICATION RULES (PREVENT FALSE VERDICTS):
+1. A source is NOT SUPPORTING merely because it repeats the claim, quotes a rumor, or shares keywords with the claim.
+2. Headlines asking questions (e.g., 'Did X die?', 'Is X in hospital?') are IRRELEVANT, NEVER SUPPORTING.
+3. Social media rumors, viral claims, and clickbait speculation are IRRELEVANT, NEVER SUPPORTING.
+4. For sensitive claims about deaths, medical emergencies, disasters, or arrests:
+   - ONLY classify as SUPPORTING if the item represents authoritative reporting (major news agency, official obituary, police/government statement) explicitly confirming the event occurred.
+   - If the item reports that the rumor is false, debunked, or that the subject is alive, classify as CONTRADICTING.
+   - If the item merely notes that a rumor exists without independent confirmation, classify as IRRELEVANT.
+5. Base your decision EXCLUSIVELY on the text in the provided Title and Snippet.
+6. When uncertain, classify as IRRELEVANT.
 
-CONTRADICTING:
-The evidence provides information that directly disputes,
-refutes, disproves, or contradicts the claim.
-
-IRRELEVANT:
-The evidence does not provide meaningful support or contradiction.
-
-IMPORTANT RULES:
-
-1. Evaluate the evidence against the exact claim.
-2. Use ONLY the supplied evidence.
-3. Do NOT use outside knowledge.
-4. Do NOT assume that a source agrees with the claim merely
-   because its title contains similar words.
-5. Do NOT classify an item as supporting or contradicting
-   unless the supplied title or snippet provides meaningful
-   evidence for that classification.
-6. Every ITEM must receive exactly one classification.
-7. Preserve the original item number.
-8. Return ONLY valid JSON.
-9. Do not use Markdown.
-10. Do not include explanations outside the JSON.
-
-Return exactly this structure:
-
+Return ONLY a valid JSON array in this exact format:
 [
   {{"item": 1, "classification": "SUPPORTING"}},
   {{"item": 2, "classification": "CONTRADICTING"}},
@@ -579,149 +379,43 @@ EVIDENCE:
 {evidence_text}
 """
 
-    # ---------------------------------------------------------------
-    # Gemini classification
-    # ---------------------------------------------------------------
-
     try:
+        client = genai.Client(api_key=api_key)
+        raw = _gemini_classify(client, prompt)
+        classifications = _extract_json_array(raw)
 
-        client = genai.Client(
-            api_key=api_key
-        )
+        if not classifications:
+            raise ValueError("Could not parse JSON classification array from Gemini response.")
 
-        raw = _gemini_classify(
-            client,
-            prompt,
-        )
-
-        print(
-            "[classifier] Parsing Gemini classification response..."
-        )
-
-        classifications = _extract_json_array(
-            raw
-        )
-
-        print(
-            f"[classifier] RAW GEMINI RESPONSE: {raw}"
-        )
-
-        if classifications is None:
-
-            print(
-                "[classifier] WARNING: Could not parse "
-                "Gemini response as a JSON classification array."
-            )
-
-            raise ValueError(
-                "Gemini returned an invalid classification format."
-            )
-
-        print(
-            f"[classifier] Gemini returned "
-            f"{len(classifications)} classification(s)."
-        )
-
-        classified_item_numbers = set()
-
-        for result in classifications:
-
-            if not isinstance(result, dict):
+        classified_indices = set()
+        for res in classifications:
+            if not isinstance(res, dict):
                 continue
-
             try:
-
-                item_number = int(
-                    result.get("item")
-                )
-
-            except (
-                TypeError,
-                ValueError,
-            ):
-
+                item_num = int(res.get("item"))
+            except (TypeError, ValueError):
                 continue
 
-            if (
-                item_number < 1
-                or item_number > len(remaining)
-            ):
+            if item_num < 1 or item_num > len(remaining):
                 continue
 
-            classification = _normalize_classification(
-                result.get("classification")
-            )
-
-            if classification is None:
+            cls = _normalize_classification(res.get("classification"))
+            if not cls or item_num in classified_indices:
                 continue
 
-            if item_number in classified_item_numbers:
-                continue
+            classified_indices.add(item_num)
+            item = remaining[item_num - 1]
 
-            classified_item_numbers.add(
-                item_number
-            )
-
-            item = remaining[
-                item_number - 1
-            ]
-
-            if classification == "SUPPORTING":
-
+            if cls == "SUPPORTING":
                 supporting.append(item)
-
-            elif classification == "CONTRADICTING":
-
+            elif cls == "CONTRADICTING":
                 contradicting.append(item)
 
-        print(
-            f"[classifier] Final Gemini classification: "
-            f"{len(supporting)} supporting | "
-            f"{len(contradicting)} contradicting | "
-            f"{len(remaining) - len(classified_item_numbers)} irrelevant/unclassified."
-        )
-
-        return (
-            supporting[:5],
-            contradicting[:5],
-        )
+        return supporting[:5], contradicting[:5]
 
     except Exception as error:
-
-        print(
-            f"[classifier] WARNING: Gemini classification failed: {error}"
-        )
-
-        # -----------------------------------------------------------
-        # Emergency local fallback
-        # -----------------------------------------------------------
-
-        print(
-            "[classifier] Using conservative local evidence fallback."
-        )
-
-        fallback_supporting, fallback_contradicting = (
-            _local_fallback_classify(
-                claim,
-                remaining,
-            )
-        )
-
-        supporting.extend(
-            fallback_supporting
-        )
-
-        contradicting.extend(
-            fallback_contradicting
-        )
-
-        print(
-            f"[classifier] Local fallback: "
-            f"{len(fallback_supporting)} supporting | "
-            f"{len(fallback_contradicting)} contradicting."
-        )
-
-    return (
-        supporting[:5],
-        contradicting[:5],
-    )
+        print(f"[classifier] Gemini classification fallback triggered: {error}")
+        fb_sup, fb_con = _local_fallback_classify(claim, remaining)
+        supporting.extend(fb_sup)
+        contradicting.extend(fb_con)
+        return supporting[:5], contradicting[:5]

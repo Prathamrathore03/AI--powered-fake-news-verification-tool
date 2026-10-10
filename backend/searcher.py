@@ -3,9 +3,9 @@ Evidence Searcher for VERITO
 
 Search strategy:
 1. DuckDuckGo via ddgs — free, no API key required.
-2. Multiple focused queries are generated from the claim so long claims
-   do not produce useless search results.
-3. Google Custom Search is used as a fallback if configured.
+2. Focused queries generated from the claim so search engines return relevant corroboration/refutation.
+3. Early exit if sufficient evidence is retrieved (avoids throttling and minimizes latency).
+4. Google Custom Search used as optional fallback only if configured.
 """
 
 import os
@@ -17,12 +17,11 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-SEARCH_TIMEOUT = 12
+SEARCH_TIMEOUT = 10
 MAX_RESULTS = 10
 GOOGLE_CSE_URL = "https://www.googleapis.com/customsearch/v1"
 
-
-# Common words that add noise to web searches.
+# Common words that add noise to web searches
 STOP_WORDS = {
     "the", "a", "an", "and", "or", "but", "for", "with", "from",
     "that", "this", "was", "were", "has", "have", "had", "been",
@@ -32,43 +31,34 @@ STOP_WORDS = {
     "what", "when", "where", "why", "how", "will", "would", "could",
     "should", "can", "may", "also", "more", "than", "about",
     "according", "said", "says", "report", "reports", "news",
+    "article", "claimed", "claims", "claiming",
 }
 
 
 def search_evidence(claim: str) -> List[dict]:
     """
     Search for evidence related to the claim.
-
     Multiple focused searches are combined and deduplicated.
     """
-
     claim = (claim or "").strip()
-
     if not claim:
         return []
 
     results: List[dict] = []
 
-    # ---------------------------------------------------------
-    # 1. DuckDuckGo
-    # ---------------------------------------------------------
+    # 1. DuckDuckGo search
     ddg_results = _duckduckgo_search(claim)
     results.extend(ddg_results)
 
-    # ---------------------------------------------------------
-    # 2. Google fallback if DDG gives too few useful results
-    # ---------------------------------------------------------
-    if len(results) < 5:
+    # 2. Google fallback only if DDG produced fewer than 4 results and Google CSE is configured
+    if len(results) < 4:
         google_results = _google_custom_search(claim)
-
         existing_urls = {
             _normalize_url(r.get("url", ""))
             for r in results
         }
-
         for result in google_results:
             normalized = _normalize_url(result.get("url", ""))
-
             if normalized and normalized not in existing_urls:
                 results.append(result)
                 existing_urls.add(normalized)
@@ -76,24 +66,14 @@ def search_evidence(claim: str) -> List[dict]:
     return results[:MAX_RESULTS]
 
 
-# ============================================================
-# QUERY GENERATION
-# ============================================================
-
 def _build_search_queries(claim: str) -> List[str]:
     """
-    Build several short, focused search queries.
-
-    A long AI-generated claim is usually a poor search query.
-    We therefore create:
-      1. Entity/event query
-      2. Important-keyword query
-      3. Fact-check query
+    Build 2 short, focused search queries.
+    Avoid long AI-generated text queries which search engines fail to match.
     """
-
     clean = re.sub(r"\s+", " ", claim).strip()
 
-    # Remove very long trailing clauses.
+    # Strip attribution phrases like "According to reports..."
     clean = re.split(
         r"\b(?:demanding|claiming|saying|alleging|according to)\b",
         clean,
@@ -101,137 +81,76 @@ def _build_search_queries(claim: str) -> List[str]:
         flags=re.IGNORECASE,
     )[0].strip()
 
-    words = re.findall(r"[A-Za-z0-9₹$%'-]+", clean)
+    words = re.findall(r"[A-Za-z0-9'-]+", clean)
 
-    # Keep meaningful words.
     meaningful = []
-
-    for word in words:
-        lower = word.lower().strip("-'")
-
-        if len(lower) < 3:
-            continue
-
-        if lower in STOP_WORDS:
-            continue
-
-        meaningful.append(word)
-
-    # Preserve important names/entities.
-    # Capitalized words are particularly useful for news searches.
     entities = []
 
     for word in words:
-        if (
-            len(word) >= 3
-            and word[0].isupper()
-            and word.lower() not in STOP_WORDS
-        ):
+        lower = word.lower().strip("-'")
+        if len(lower) < 3 or lower in STOP_WORDS:
+            continue
+        meaningful.append(word)
+        if word[0].isupper() and len(word) >= 3:
             entities.append(word)
 
-    # Remove duplicates while preserving order.
     entities = list(dict.fromkeys(entities))
     meaningful = list(dict.fromkeys(meaningful))
 
     queries = []
 
-    # ---------------------------------------------------------
-    # Query 1: Shortened original claim
-    # ---------------------------------------------------------
+    # Query 1: Fact-check oriented (highest signal for verification)
     if meaningful:
-        query1 = " ".join(meaningful[:14])
-        queries.append(query1)
+        fact_core = " ".join(meaningful[:8])
+        queries.append(f"{fact_core} fact check")
 
-    # ---------------------------------------------------------
-    # Query 2: Main entities + event
-    # ---------------------------------------------------------
-    if entities:
-        entity_query = " ".join(entities[:8])
+    # Query 2: Entities / Core event query
+    if entities and len(entities) >= 2:
+        queries.append(" ".join(entities[:6]))
+    elif meaningful:
+        queries.append(" ".join(meaningful[:10]))
 
-        if entity_query:
-            queries.append(entity_query)
-
-    # ---------------------------------------------------------
-    # Query 3: Fact-check focused
-    # ---------------------------------------------------------
-    if meaningful:
-        fact_words = " ".join(meaningful[:10])
-        queries.append(f"{fact_words} fact check")
-
-    # ---------------------------------------------------------
-    # Query 4: Verify focused
-    # ---------------------------------------------------------
-    if meaningful:
-        verify_words = " ".join(meaningful[:10])
-        queries.append(f"{verify_words} verification")
-
-    # ---------------------------------------------------------
-    # Original claim as final fallback query.
-    # Keep it short enough for search engines.
-    # ---------------------------------------------------------
-    if clean:
-        queries.append(clean[:180])
-
-    # Deduplicate.
+    # Deduplicate queries
     final_queries = []
+    for q in queries:
+        q = re.sub(r"\s+", " ", q).strip()
+        if q and q.lower() not in {fq.lower() for fq in final_queries}:
+            final_queries.append(q)
 
-    for query in queries:
-        query = re.sub(r"\s+", " ", query).strip()
+    # Limit to at most 2 queries to avoid DDG throttling and reduce latency
+    return final_queries[:2] if final_queries else [clean[:100]]
 
-        if not query:
-            continue
-
-        if query.lower() not in {
-            q.lower() for q in final_queries
-        }:
-            final_queries.append(query)
-
-    # Maximum 4 queries so we don't hammer DDG.
-    return final_queries[:4]
-
-
-# ============================================================
-# DUCKDUCKGO
-# ============================================================
 
 def _duckduckgo_search(claim: str) -> List[dict]:
+    """
+    Search DuckDuckGo using the ddgs library.
+    Safe encoding, strict timeout, and early exit when enough results are found.
+    """
     try:
         from ddgs import DDGS
 
         queries = _build_search_queries(claim)
-
-        print("[searcher] Generated search queries:")
-
-        for query in queries:
-            print(f"[searcher]   → {query}")
-
         results: List[dict] = []
         seen_urls = set()
 
-        with DDGS() as ddgs:
-
+        with DDGS(timeout=SEARCH_TIMEOUT) as ddgs:
             for query in queries:
-
                 try:
                     search_results = ddgs.text(
                         query,
-                        max_results=5,
+                        max_results=6,
                         safesearch="moderate",
                     )
+                    if not search_results:
+                        continue
 
                     for item in search_results:
-
                         href = (item.get("href") or "").strip()
-
                         if not href:
                             continue
 
                         normalized_url = _normalize_url(href)
-
-                        if not normalized_url:
-                            continue
-
-                        if normalized_url in seen_urls:
+                        if not normalized_url or normalized_url in seen_urls:
                             continue
 
                         seen_urls.add(normalized_url)
@@ -241,84 +160,45 @@ def _duckduckgo_search(claim: str) -> List[dict]:
                         except Exception:
                             domain = href
 
-                        result = {
-                            "title": (item.get("title") or "").strip(),
-                            "url": href,
-                            "source": domain,
-                            "snippet": (
-                                item.get("body") or ""
-                            ).replace("\n", " ").strip(),
-                        }
+                        title = (item.get("title") or "").strip()
+                        snippet = (item.get("body") or "").replace("\n", " ").strip()
 
-                        # Don't keep completely empty results.
-                        if not result["title"] and not result["snippet"]:
+                        if not title and not snippet:
                             continue
 
-                        results.append(result)
+                        results.append({
+                            "title": title,
+                            "url": href,
+                            "source": domain,
+                            "snippet": snippet,
+                        })
 
-                        # We already have enough.
                         if len(results) >= MAX_RESULTS:
                             return results[:MAX_RESULTS]
 
-                except Exception as query_error:
-                    print(
-                        f"[searcher] Query failed: "
-                        f"{query_error}"
-                    )
+                    # If the first query already provided 5+ good results, exit early to save time
+                    if len(results) >= 5:
+                        break
 
-        print(
-            f"[searcher] DuckDuckGo returned "
-            f"{len(results)} unique result(s)."
-        )
+                except Exception as query_error:
+                    print(f"[searcher] Query error for '{query}': {query_error}")
 
         return results[:MAX_RESULTS]
 
     except ImportError:
-        print(
-            "[searcher] WARNING: `ddgs` not installed. "
-            "Run: pip install ddgs"
-        )
+        print("[searcher] WARNING: `ddgs` not installed.")
         return []
-
     except Exception as e:
-        err_str = str(e).lower()
-
-        if any(
-            keyword in err_str
-            for keyword in (
-                "ratelimit",
-                "202",
-                "rate limit",
-                "blocked",
-            )
-        ):
-            print(
-                "[searcher] WARNING: DuckDuckGo "
-                "rate-limited the search."
-            )
-        else:
-            print(
-                f"[searcher] WARNING: DuckDuckGo "
-                f"search error: {e}"
-            )
-
+        print(f"[searcher] WARNING: DuckDuckGo search error: {e}")
         return []
 
-
-# ============================================================
-# GOOGLE CUSTOM SEARCH FALLBACK
-# ============================================================
 
 def _google_custom_search(claim: str) -> List[dict]:
-    api_key = os.getenv(
-        "GOOGLE_SEARCH_API_KEY",
-        ""
-    ).strip()
-
-    cse_id = os.getenv(
-        "GOOGLE_CSE_ID",
-        ""
-    ).strip()
+    """
+    Query Google Custom Search JSON API (optional fallback).
+    """
+    api_key = os.getenv("GOOGLE_SEARCH_API_KEY", "").strip()
+    cse_id = os.getenv("GOOGLE_CSE_ID", "").strip()
 
     if not api_key or not cse_id:
         return []
@@ -327,16 +207,14 @@ def _google_custom_search(claim: str) -> List[dict]:
         import requests
 
         queries = _build_search_queries(claim)
-
         results = []
 
-        for query in queries[:2]:
-
+        for query in queries[:1]:
             params = {
                 "key": api_key,
                 "cx": cse_id,
                 "q": query[:200],
-                "num": 10,
+                "num": 5,
                 "safe": "active",
                 "lr": "lang_en",
             }
@@ -347,87 +225,42 @@ def _google_custom_search(claim: str) -> List[dict]:
                 timeout=SEARCH_TIMEOUT,
             )
 
-            if response.status_code == 429:
-                print(
-                    "[searcher] WARNING: Google Custom "
-                    "Search daily quota exceeded."
-                )
-                return results
-
-            if response.status_code == 403:
-                print(
-                    "[searcher] WARNING: Google Custom "
-                    "Search 403 — check credentials."
-                )
-                return results
-
             if not response.ok:
-                print(
-                    f"[searcher] WARNING: Google Custom "
-                    f"Search HTTP {response.status_code}."
-                )
                 continue
 
             data = response.json()
-
             for item in data.get("items", []):
-
                 url = (item.get("link") or "").strip()
-
                 if not url:
                     continue
-
                 results.append({
-                    "title": (
-                        item.get("title") or ""
-                    ).strip(),
-
+                    "title": (item.get("title") or "").strip(),
                     "url": url,
-
-                    "source": (
-                        item.get("displayLink") or ""
-                    ).strip(),
-
-                    "snippet": (
-                        item.get("snippet") or ""
-                    ).replace("\n", " ").strip(),
+                    "source": (item.get("displayLink") or "").strip(),
+                    "snippet": (item.get("snippet") or "").replace("\n", " ").strip(),
                 })
 
         return results[:MAX_RESULTS]
 
     except Exception as e:
-        print(
-            f"[searcher] WARNING: Google Custom "
-            f"Search error: {e}"
-        )
+        print(f"[searcher] WARNING: Google Custom Search error: {e}")
         return []
 
 
-# ============================================================
-# URL NORMALIZATION
-# ============================================================
-
 def _normalize_url(url: str) -> str:
-    """
-    Normalize URLs so duplicate search results are removed.
-    """
-
+    """Normalize URLs to prevent duplicate search results."""
     try:
         parsed = urlparse(url)
-
         if not parsed.netloc:
             return ""
 
         scheme = parsed.scheme.lower() or "https"
         domain = parsed.netloc.lower()
 
-        # Remove www.
         if domain.startswith("www."):
             domain = domain[4:]
 
         path = parsed.path.rstrip("/")
-
         return f"{scheme}://{domain}{path}".lower()
-
     except Exception:
         return url.strip().lower()
